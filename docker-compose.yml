@@ -1,0 +1,298 @@
+
+services:
+  # DATABASE LAYER
+
+  # postgres:
+  #   image: timescale/timescaledb:latest-pg16
+  #   container_name: agent_observatory_db
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: ${POSTGRES_USER}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  #     POSTGRES_DB: ${POSTGRES_DB:-agent_observatory}
+  #     POSTGRES_PORT: ${POSTGRES_PORT}
+  #     POSTGRES_INITDB_ARGS: "-E UTF8"
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #     - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-observatory}"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - backend-network
+
+  # CACHE LAYER
+ 
+  redis:
+    image: redis:7-alpine
+    container_name: agent_observatory_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - backend-network
+
+
+  # API LAYER
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: agent_observatory_api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      # API Settings
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - backend-network
+      - streaming-network  # Needs access to Kafka
+
+  # STREAMING LAYER 
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.5
+    container_name: agent_observatory_redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --default-log-level=info
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    ports:
+      - "18082:18082"  # HTTP Proxy
+      - "19092:19092"  # Kafka API
+      - "19644:9644"   # Admin API
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - streaming-network
+    profiles:
+      - phase3
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: agent_observatory_console
+    restart: unless-stopped
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://redpanda:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+        server:
+          listenPort: 8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - streaming-network
+    profiles:
+      - phase3
+
+  # STREAM PROCESSING 
+
+  stream-processor:
+    build:
+      context: ./services/stream-processor
+      dockerfile: Dockerfile
+    #container_name: agent_observatory_processor
+    restart: unless-stopped
+    environment:
+      # Kafka
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      KAFKA_CONSUMER_GROUP: agent-event-processor
+      KAFKA_TOPIC: agent-events
+      # Database
+      DATABASE_URL: ${DATABASE_URL} 
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+      # Settings
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    depends_on:
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - ./services/stream-processor:/app:ro
+    networks:
+      - backend-network    
+      - streaming-network  
+    profiles:
+      - phase3
+
+  # DLQ PROCESSOR
+  dlq-processor:
+    build:
+      context: ./services/dlq-processor
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      KAFKA_DLQ_TOPIC: agent-events-dlq
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    depends_on:
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    networks:
+      - backend-network
+      - streaming-network
+    profiles:
+      - phase3
+
+   # ALERTS CONSUMER
+  alerts-consumer:
+    build:
+      context: ./services/consumers
+      dockerfile: Dockerfile
+    command: ["python", "-u", "alerts_consumer.py"]
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      KAFKA_TOPIC: agent-events
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    depends_on:
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    networks:
+      - backend-network
+      - streaming-network
+    profiles:
+      - phase3
+
+  # DASHBOARD
+  dashboard:
+    build:
+      context: ./services/dashboard
+      dockerfile: Dockerfile
+    container_name: agent_observatory_dashboard
+    restart: unless-stopped
+    environment:
+      API_BASE_URL: http://api:8000
+      STREAMLIT_SERVER_PORT: 8501
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    networks:
+      - backend-network
+    profiles:
+      - phase3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  event-generator:
+    build:
+      context: ./services/ingestion
+      dockerfile: Dockerfile
+    container_name: agent_observatory_generator
+    restart: unless-stopped
+    environment:
+      API_URL: http://api:8000
+      EVENTS_PER_BATCH: 50 ##You can configure the number of events per batch here
+      BATCH_INTERVAL: 10 #Also here you can set the interval between batches in seconds
+      NUM_AGENTS: 20 ##and here too the number of simulated agents
+      CONCURRENT_REQUESTS: 10
+    command: python -u generator.py
+    depends_on:
+      - api
+    networks:
+      - backend-network
+    profiles:
+      - testing
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# NETWORKS
+networks:
+  # Backend services
+  backend-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+  # Streaming services
+  streaming-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+
+# VOLUMES
+
+volumes:
+  redis_data:
+    driver: local
+  redpanda_data:
+    driver: local
+  pgadmin_data:
+    driver: local
